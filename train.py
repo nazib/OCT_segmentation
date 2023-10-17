@@ -70,7 +70,7 @@ def train_model(
     # 4-fold Cross Validation model evaluation
     kfold = KFold(n_splits=4, shuffle=True)
     fold_results = {}
-
+    print("testing ssh")
     for fold, (train_ids, val_ids) in enumerate(kfold.split(np.arange(len(train_dataset)))):
         
         train_subsampler = torch.utils.data.SubsetRandomSampler(train_ids)

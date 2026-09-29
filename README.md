@@ -4,7 +4,16 @@
   - [With Docker](#with-docker)
   - [Training](#training)
   - [Prediction](#prediction)
+  - [Inference Server](#inference-server)
 - [Weights \& Biases](#weights--biases)
+
+## About
+
+This project trains a [U-Net](https://arxiv.org/abs/1505.04597) model to segment retinal blood
+vessels in optical coherence tomography (OCT) / fundus images, and serves the trained model
+behind a Flask/gevent HTTP inference server (`app.py`) so it can be integrated into other
+systems. Given an input image, the server returns a PNG with the predicted vessel mask
+overlaid on the original image.
 
 ## Quick start
 
@@ -105,6 +114,42 @@ optional arguments:
                         Scale factor for the input images
 ```
 You can specify which model file to use with `--model MODEL.pth`.
+
+### Inference Server
+
+`app.py` serves the trained model over HTTP so it can be integrated into other systems,
+instead of running predictions from the CLI.
+
+**Run without Docker:**
+
+1. Place a trained model at `weights/final_model.pth` (see [Download Model](#with-docker) above).
+2. Start the server:
+   ```bash
+   python app.py
+   ```
+   The server listens on port `8080` by default; set the `PORT` environment variable to
+   change it. It runs on CPU.
+
+**Run with Docker:** building and running the image (see [With Docker](#with-docker) above)
+starts this same server via `entrypoint.sh`.
+
+**Endpoints:**
+
+| Method | Path       | Description                                                            |
+|--------|------------|-------------------------------------------------------------------------|
+| GET    | `/health`  | Returns `200` with a status message if the container is running.       |
+| POST   | `/segment` | Accepts an image, returns a PNG with the predicted mask overlaid on it. |
+
+**Example request:**
+
+```bash
+curl -X POST http://localhost:8080/segment \
+  -F "image=@/path/to/input_image.tif" \
+  -o segmentation.png
+```
+
+The response body is a `segmentation.png` image (`Content-Type: image/png`) containing the
+input image with the predicted vessel mask drawn on top of it.
 
 ## Weights & Biases
 

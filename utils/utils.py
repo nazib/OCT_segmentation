@@ -1,4 +1,3 @@
-import matplotlib.pyplot as plt
 import logging
 import numpy as np
 from PIL import Image
@@ -78,6 +77,7 @@ class ColorizedArgsFormatter(logging.Formatter):
         return formatted
 
 def plot_img_and_mask(img, mask):
+    import matplotlib.pyplot as plt  # imported lazily: only needed for --viz, not for serving
     classes = mask.max() + 1
     fig, ax = plt.subplots(1, classes + 1)
     ax[0].set_title('Input image')

@@ -5,15 +5,19 @@
   - [Training](#training)
   - [Prediction](#prediction)
   - [Inference Server](#inference-server)
+- [Kubernetes](#kubernetes)
+- [CI](#ci)
 - [Weights \& Biases](#weights--biases)
 
 ## About
 
 This project trains a [U-Net](https://arxiv.org/abs/1505.04597) model to segment retinal blood
 vessels in optical coherence tomography (OCT) / fundus images, and serves the trained model
-behind a Flask/gevent HTTP inference server (`app.py`) so it can be integrated into other
-systems. Given an input image, the server returns a PNG with the predicted vessel mask
-overlaid on the original image.
+behind an async FastAPI inference server (`app.py`) so it can be integrated into other systems.
+Given an input image, the server returns a PNG with the predicted vessel mask overlaid on the
+original image. Concurrent requests are coalesced by an async micro-batcher (`batcher.py`) into
+a single model forward pass, and the server exposes Kubernetes-style liveness/readiness probes
+and Prometheus metrics.
 
 ## Quick start
 
@@ -40,15 +44,22 @@ python train.py --dataset-dir $PATH_TO_DATASET --load-dir $MODEL_NAME --classes 
 ```bash
 curl https://get.docker.com | sh && sudo systemctl --now enable docker
 ```
-2. Build docker image using
+2. Before building, [download a trained model](https://drive.google.com/drive/u/0/folders/1i_kX8HDWj2sMAC6Lw03dLKc988R9jbC7)
+   and put it at `weights/final_model.pth`. The build bakes the weights into the image so the
+   container never needs network access at runtime.
+3. Build the image:
+   ```bash
+   docker build -t oct-segmentation .
    ```
-   docker build -t $DOCKER_IMAG_ENAME
+   This is a multi-stage build: dependencies are resolved in a `builder` stage (the only stage
+   that needs network access), and the final `runtime` stage contains just the app, the model
+   weights and a minimal Python runtime, running as a non-root user (uid `10001`).
+4. Run it:
+   ```bash
+   docker run --rm -p 8080:8080 oct-segmentation
    ```
-3. Run the docker image. The docker Image will run the model server which is developed using flask app. The docker container will wait for an image to be sent to the server for model prediction. Before creating docker image please download a trained model and put the model to the weights directory with the name "final_model.pth"
-4. [Download Model:](https://drive.google.com/drive/u/0/folders/1i_kX8HDWj2sMAC6Lw03dLKc988R9jbC7)
-```
-docker run $DOCKER_IMAG_ENAME
-```
+   The container starts the same FastAPI inference server described in
+   [Inference Server](#inference-server) below, and needs no network access to run.
 
 ### Training
 
@@ -118,12 +129,14 @@ You can specify which model file to use with `--model MODEL.pth`.
 ### Inference Server
 
 `app.py` serves the trained model over HTTP so it can be integrated into other systems,
-instead of running predictions from the CLI.
+instead of running predictions from the CLI. It's built on FastAPI + Uvicorn (not the old
+Flask/gevent server) so it can batch concurrent requests asynchronously.
 
 **Run without Docker:**
 
-1. Place a trained model at `weights/final_model.pth` (see [Download Model](#with-docker) above).
-2. Start the server:
+1. Install serving dependencies: `pip install -r requirements-serving.txt`
+2. Place a trained model at `weights/final_model.pth` (see [Download Model](#with-docker) above).
+3. Start the server:
    ```bash
    python app.py
    ```
@@ -131,14 +144,16 @@ instead of running predictions from the CLI.
    change it. It runs on CPU.
 
 **Run with Docker:** building and running the image (see [With Docker](#with-docker) above)
-starts this same server via `entrypoint.sh`.
+starts this same server automatically.
 
 **Endpoints:**
 
-| Method | Path       | Description                                                            |
-|--------|------------|-------------------------------------------------------------------------|
-| GET    | `/health`  | Returns `200` with a status message if the container is running.       |
-| POST   | `/segment` | Accepts an image, returns a PNG with the predicted mask overlaid on it. |
+| Method | Path       | Description                                                                  |
+|--------|------------|-------------------------------------------------------------------------------|
+| GET    | `/healthz` | Liveness probe — `200` once the process is up, independent of model state.    |
+| GET    | `/readyz`  | Readiness probe — `200` once the model is loaded and the batcher is running, `503` otherwise. |
+| GET    | `/metrics` | Prometheus metrics in text exposition format.                                 |
+| POST   | `/segment` | Accepts an image, returns a PNG with the predicted mask overlaid on it.       |
 
 **Example request:**
 
@@ -150,6 +165,49 @@ curl -X POST http://localhost:8080/segment \
 
 The response body is a `segmentation.png` image (`Content-Type: image/png`) containing the
 input image with the predicted vessel mask drawn on top of it.
+
+**Micro-batching:** concurrent `/segment` requests are coalesced by an async micro-batcher
+(`batcher.py`) into a single model forward pass, instead of running one forward pass per
+request. Tunable via environment variables:
+
+| Variable            | Default                     | Meaning                                                              |
+|----------------------|------------------------------|------------------------------------------------------------------------|
+| `MODEL_PATH`          | `weights/final_model.pth`   | Path to the trained model checkpoint.                                 |
+| `INFERENCE_SIZE`      | `256`                        | Images are resized to `INFERENCE_SIZE x INFERENCE_SIZE` before batching (so images of any size can be stacked into one tensor), then the mask is resized back to the original resolution. |
+| `BATCH_MAX_SIZE`      | `8`                           | Maximum number of requests coalesced into one forward pass.           |
+| `BATCH_MAX_WAIT_MS`   | `10`                          | Maximum time the batcher waits for more requests before running a partial batch. |
+
+**Metrics** exposed at `/metrics` (Prometheus text format) include `segment_requests_total`
+(by outcome), `segment_request_latency_seconds`, `inference_batch_size`,
+`inference_batch_latency_seconds`, and `inference_queue_depth`.
+
+## Kubernetes
+
+Manifests live in [`k8s/`](k8s) and are managed with [Kustomize](https://kustomize.io/):
+
+```bash
+kubectl apply -k k8s
+```
+
+This deploys `oct-segmentation` as a `Deployment` (2 replicas, running as non-root uid `10001`
+with a read-only root filesystem) fronted by a `ClusterIP` `Service`, with:
+
+- **Liveness/readiness probes** wired to `/healthz` and `/readyz`, plus a `startupProbe` on
+  `/readyz` that gives the model up to 150s to load before the readiness probe takes over.
+- **Prometheus scraping** via `prometheus.io/*` annotations on the pod and service. If your
+  cluster runs the [Prometheus Operator](https://prometheus-operator.dev/), uncomment
+  `servicemonitor.yaml` in `k8s/kustomization.yaml` instead.
+
+Update `image:` in `k8s/deployment.yaml` (or `k8s/kustomization.yaml`'s `images:` block) to
+point at wherever you push the image built from the [Dockerfile](Dockerfile).
+
+## CI
+
+- **GitHub Actions** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): lints with
+  `ruff`, runs the `pytest` suite, builds the Docker image, and validates the Kubernetes
+  manifests against upstream schemas with `kubeconform`.
+- **GitLab CI** ([`.gitlab-ci.yml`](.gitlab-ci.yml)): mirrors the same four stages
+  (lint, test, build, validate-manifests).
 
 ## Weights & Biases
 

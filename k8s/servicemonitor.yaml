@@ -1,0 +1,18 @@
+# Optional: only apply this if your cluster runs the Prometheus Operator
+# (i.e. the ServiceMonitor CRD is installed). Clusters using plain
+# Prometheus with annotation-based scrape discovery can rely on the
+# prometheus.io/* annotations on service.yaml instead and skip this file.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: oct-segmentation
+  labels:
+    app.kubernetes.io/name: oct-segmentation
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: oct-segmentation
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
